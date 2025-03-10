@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Subtitles</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+        #subtitles { font-size: 24px; font-weight: bold; margin-top: 20px; color: #000000; }
+        input, button { margin: 10px; padding: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Real-Time Video to Subtitles</h1>
+    
+    <input type="file" id="fileInput"><br><br>
+    
+    <button onclick="uploadFile()" style="color:white; background-color: black; border-radius: 5px; border:none;">
+        Upload & Generate Subtitles
+    </button>
+
+    <button onclick="startWebSocket()" style="color:white; background-color: black; border-radius: 5px; border:none;">
+        Generate
+    </button>
+    
+    <div id="subtitles">Upload a video</div>
+
+    <script>
+        function uploadFile() {
+            let fileInput = document.getElementById("fileInput");
+
+            if (fileInput.files.length === 0) {
+                alert(" Please select a file first.");
+                return;
+            }
+
+            let formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+
+            fetch("http://127.0.0.1:8000/upload/", {
+                method: "POST",
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.message.includes("successfully")) {
+                    alert(" File uploaded successfully! Click 'Generate' to start subtitles.");
+                } else {
+                    alert(" Upload failed: " + data.message);
+                }
+            })
+            .catch(error => alert(" Error uploading file. Check backend logs."));
+        }
+
+        function startWebSocket() {
+            let ws = new WebSocket("ws://127.0.0.1:8000/ws");
+
+            ws.onopen = function() {
+                console.log(" WebSocket connection established");
+                document.getElementById("subtitles").innerText = "Generating subtitles...";
+            };
+
+            ws.onmessage = function(event) {
+                let data = JSON.parse(event.data);
+                if (data.subtitle !== "") {
+                    document.getElementById("subtitles").innerText = data.subtitle;
+                }
+            };
+
+            ws.onclose = function() {
+                console.log(" WebSocket connection closed");
+                document.getElementById("subtitles").innerText = "Subtitle generation complete.";
+            };
+
+            ws.onerror = function(error) {
+                console.error(" WebSocket error: ", error);
+                alert(" WebSocket connection failed. Ensure backend is running.");
+            };
+        }
+    </script>
+</body>
+</html>
