@@ -1,118 +1,82 @@
 import os
-import json
+import logging
+import threading
 import time
-import wave
-import asyncio
-import shutil
-import subprocess
-from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
-from vosk import Model, KaldiRecognizer
+import whisper
+import moviepy.editor as mp
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask_socketio import SocketIO
+from flask_cors import CORS
 
-app = FastAPI()
+app = Flask(_name_, static_folder="uploads")
+socketio = SocketIO(app, cors_allowed_origins="*")
+CORS(app)
 
-# Paths
-UPLOAD_DIR = "backend/audio"
-FRONTEND_PATH = "C:/Users/ccs/Desktop/sign/backend/frontend.html"
-VOSK_MODEL_PATH = "C:/Users/ccs/Desktop/sign/backend/models/vosk-model-small-en-us-0.15"
+UPLOAD_FOLDER = "uploads"
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
 
-# Ensure directories exist
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Load Whisper model once for faster processing
+whisper_model = whisper.load_model("base")
 
-# Check if VOSK model exists
-if not os.path.exists(VOSK_MODEL_PATH):
-    raise RuntimeError(f" Vosk model not found at {VOSK_MODEL_PATH}. Download it from https://alphacephei.com/vosk/models and place it correctly.")
+# Ensure the logging is set up
+logging.basicConfig(level=logging.INFO)
 
-# Serve frontend HTML
-@app.get("/", response_class=FileResponse)
-async def serve_html():
-    if os.path.exists(FRONTEND_PATH):
-        return FRONTEND_PATH
-    raise HTTPException(status_code=404, detail="Frontend file not found")
+def extract_audio(video_path, audio_path="uploads/audio.wav"):
+    """Extracts audio from a video file."""
+    video = mp.VideoFileClip(video_path)
+    video.audio.write_audiofile(audio_path)
+    return audio_path
 
-# Convert uploaded audio to WAV format
-def convert_audio_to_wav(input_audio, output_wav):
+def stream_subtitles(audio_path):
+    """Streams subtitles in real-time using Whisper."""
+    result = whisper_model.transcribe(audio_path, word_timestamps=True)
+    
+    for segment in result["segments"]:
+        start_time = segment["start"]
+        end_time = segment["end"]
+        text = segment["text"]
+
+        # Emit subtitle data with proper start and end times
+        socketio.emit("subtitle", {"start": start_time, "end": end_time, "text": text})
+        time.sleep(end_time - start_time)  # Simulate real-time streaming
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/upload", methods=["POST"])
+def upload_video():
+    """Handles video upload and starts real-time subtitle generation."""
+    if "video" not in request.files:
+        logging.error("No video file part in the request")
+        return jsonify({"error": "No video uploaded"}), 400
+    
+    file = request.files["video"]
+    if file.filename == "":
+        logging.error("No selected file")
+        return jsonify({"error": "No file selected"}), 400
+
     try:
-        subprocess.run(["ffmpeg", "-i", input_audio, "-ac", "1", "-ar", "16000", output_wav, "-y"], check=True)
-        print(f" Audio converted: {output_wav}")
-        return output_wav
-    except subprocess.CalledProcessError as e:
-        print(f" FFmpeg conversion failed: {e}")
-        raise HTTPException(status_code=500, detail="Audio conversion failed")
+        video_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        file.save(video_path)
+        logging.info(f"Video saved at: {video_path}")
 
-# Real-time transcription with subtitle buffering
-async def transcribe_audio(websocket: WebSocket, audio_path):
-    print(f"Starting transcription for: {audio_path}")
+        audio_path = extract_audio(video_path)
 
-    if not os.path.exists(audio_path):
-        await websocket.send_text(json.dumps({"subtitle": " Error: Audio file missing"}))
-        return
+        # Run subtitle streaming in a separate thread
+        threading.Thread(target=stream_subtitles, args=(audio_path,)).start()
 
-    try:
-        model = Model(VOSK_MODEL_PATH)
-        wf = wave.open(audio_path, "rb")
-        recognizer = KaldiRecognizer(model, wf.getframerate())
-        recognizer.SetWords(True)
+        return jsonify({"video_url": f"/uploads/{file.filename}"}), 200
 
-        sentence_buffer = []
-        last_sent_time = time.time()
-
-        while True:
-            data = wf.readframes(4000)
-            if not data:
-                print(" No more audio data to process.")
-                break
-
-            if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
-                if "result" in result:
-                    words = [word_info["word"] for word_info in result["result"]]
-                    sentence_buffer.extend(words)
-
-            # Send subtitles every 1.5 seconds or if buffer has 5+ words
-            if (time.time() - last_sent_time > 1.5 and sentence_buffer) or len(sentence_buffer) >= 5:
-                full_sentence = " ".join(sentence_buffer)
-                await websocket.send_text(json.dumps({"subtitle": full_sentence}))
-                print(f"📢 Sent subtitle: {full_sentence}")
-                sentence_buffer = []
-                last_sent_time = time.time()
-
-        # Send remaining words
-        if sentence_buffer:
-            await websocket.send_text(json.dumps({"subtitle": " ".join(sentence_buffer)}))
-
-        await websocket.send_text(json.dumps({"subtitle": ""}))  # End signal
-        print(" Transcription complete.")
     except Exception as e:
-        print(f" Error during transcription: {e}")
-        await websocket.send_text(json.dumps({"subtitle": f"Error: {str(e)}"}))
+        logging.error(f"Error saving video: {str(e)}")
+        return jsonify({"error": "Error saving video"}), 500
 
-# API to upload audio files
-@app.post("/upload/")
-async def upload_file(file: UploadFile = File(...)):
-    # Validate file type
-    if not file.filename.lower().endswith(('.wav', '.mp3', '.mp4', '.m4a', '.aac', '.ogg')):
-        raise HTTPException(status_code=400, detail=" Unsupported file type. Please upload an audio file.")
+@app.route("/uploads/<filename>")
+def uploaded_file(filename):
+    """Serves uploaded videos."""
+    return send_from_directory(UPLOAD_FOLDER, filename)
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    print(f" Uploaded file: {file_path}")
-
-    # Convert to WAV
-    wav_path = os.path.join(UPLOAD_DIR, "converted_audio.wav")
-    convert_audio_to_wav(file_path, wav_path)
-
-    return {"message": " File uploaded and converted successfully", "wav_path": wav_path}
-
-# WebSocket for real-time subtitle streaming
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    print(" WebSocket connection established")
-    await websocket.accept()
-    audio_path = os.path.join(UPLOAD_DIR, "converted_audio.wav")
-    await transcribe_audio(websocket, audio_path)
-    print(" WebSocket connection closed")
-    await websocket.close()
+if _name_ == "_main_":
+    socketio.run(app, debug=True)
